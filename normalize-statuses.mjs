@@ -11,15 +11,19 @@
  * Run: node career-ops/normalize-statuses.mjs [--dry-run]
  */
 
-import { readFileSync, writeFileSync, copyFileSync, existsSync } from 'fs';
-import { join } from 'path';
+import { readFileSync, copyFileSync, existsSync, mkdirSync } from 'fs';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
+import {
+  openTrackerTransaction, rebuildRow, resolveTrackerPath,
+} from './tracker-utils.mjs';
 
-const CAREER_OPS = new URL('.', import.meta.url).pathname;
-// Support both layouts: data/applications.md (boilerplate) and applications.md (original)
-const APPS_FILE = existsSync(join(CAREER_OPS, 'data/applications.md'))
-  ? join(CAREER_OPS, 'data/applications.md')
-  : join(CAREER_OPS, 'applications.md');
+const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
+const APPS_FILE = resolveTrackerPath(CAREER_OPS);
 const DRY_RUN = process.argv.includes('--dry-run');
+
+// Ensure required directories exist (fresh setup)
+mkdirSync(join(CAREER_OPS, 'data'), { recursive: true });
 
 // Canonical status mapping
 function normalizeStatus(raw) {
@@ -27,66 +31,57 @@ function normalizeStatus(raw) {
   let s = raw.replace(/\*\*/g, '').trim();
   const lower = s.toLowerCase();
 
-  // DUPLICADO variants → Descartado
+  // DUPLICADO variants → Discarded
   if (/^duplicado/i.test(s) || /^dup\b/i.test(s)) {
-    return { status: 'Descartado', moveToNotes: raw.trim() };
+    return { status: 'Discarded', moveToNotes: raw.trim() };
   }
 
-  // CERRADA → Descartado
-  if (/^cerrada$/i.test(s)) return { status: 'Descartado' };
+  // CERRADA / Cancelada / Descartada → Discarded
+  if (/^cerrada$/i.test(s)) return { status: 'Discarded' };
+  if (/^cancelada/i.test(s)) return { status: 'Discarded' };
+  if (/^descartada$/i.test(s)) return { status: 'Discarded' };
+  if (/^descartado$/i.test(s)) return { status: 'Discarded' };
 
-  // Cancelada (possibly with date) → Descartado
-  if (/^cancelada/i.test(s)) return { status: 'Descartado' };
+  // Rechazada / Rechazado → Rejected
+  if (/^rechazada?$/i.test(s)) return { status: 'Rejected' };
+  if (/^rechazado\s+\d{4}/i.test(s)) return { status: 'Rejected' };
 
-  // Descartada → Descartado
-  if (/^descartada$/i.test(s)) return { status: 'Descartado' };
+  // Aplicado with date → Applied (strip date)
+  if (/^aplicado\s+\d{4}/i.test(s)) return { status: 'Applied' };
 
-  // Rechazada → Rechazado
-  if (/^rechazada$/i.test(s)) return { status: 'Rechazado' };
+  // CONDICIONAL / HOLD / EVALUAR / Verificar → Evaluated
+  if (/^(condicional|hold|evaluar|verificar)$/i.test(s)) return { status: 'Evaluated' };
 
-  // Rechazado with date → Rechazado (strip date)
-  if (/^rechazado\s+\d{4}/i.test(s)) return { status: 'Rechazado' };
+  // MONITOR → SKIP
+  if (/^monitor$/i.test(s)) return { status: 'SKIP' };
 
-  // Aplicado with date → Aplicado (strip date)
-  if (/^aplicado\s+\d{4}/i.test(s)) return { status: 'Aplicado' };
+  // GEO BLOCKER → SKIP
+  if (/geo.?blocker/i.test(s)) return { status: 'SKIP' };
 
-  // CONDICIONAL → Evaluada
-  if (/^condicional$/i.test(s)) return { status: 'Evaluada' };
+  // Repost #NNN → Discarded
+  if (/^repost/i.test(s)) return { status: 'Discarded', moveToNotes: raw.trim() };
 
-  // HOLD → Evaluada
-  if (/^hold$/i.test(s)) return { status: 'Evaluada' };
+  // "—" (em dash, no status) → Discarded
+  if (s === '—' || s === '-' || s === '') return { status: 'Discarded' };
 
-  // MONITOR → Evaluada
-  if (/^monitor$/i.test(s)) return { status: 'Evaluada' };
-
-  // EVALUAR → Evaluada
-  if (/^evaluar$/i.test(s)) return { status: 'Evaluada' };
-
-  // Verificar → Evaluada
-  if (/^verificar$/i.test(s)) return { status: 'Evaluada' };
-
-  // GEO BLOCKER → NO APLICAR
-  if (/geo.?blocker/i.test(s)) return { status: 'NO APLICAR' };
-
-  // Repost #NNN → Descartado
-  if (/^repost/i.test(s)) return { status: 'Descartado', moveToNotes: raw.trim() };
-
-  // "—" (em dash, no status) → Descartado
-  if (s === '—' || s === '-' || s === '') return { status: 'Descartado' };
-
-  // Already canonical — just fix casing/bold
+  // Already canonical (English, per states.yml) — just fix casing/bold
   const canonical = [
-    'Evaluada', 'Aplicado', 'Respondido', 'Entrevista',
-    'Oferta', 'Rechazado', 'Descartado', 'NO APLICAR',
+    'Evaluated', 'Applied', 'Responded', 'Interview',
+    'Offer', 'Hired', 'Rejected', 'Discarded', 'SKIP',
   ];
   for (const c of canonical) {
     if (lower === c.toLowerCase()) return { status: c };
   }
 
-  // Aliases from states.yml
-  if (['enviada', 'aplicada', 'applied', 'sent'].includes(lower)) return { status: 'Aplicado' };
-  if (['cerrada', 'descartada'].includes(lower)) return { status: 'Descartado' };
-  if (['no aplicar', 'no_aplicar', 'skip'].includes(lower)) return { status: 'NO APLICAR' };
+  // Spanish aliases → English canonicals
+  if (['evaluada'].includes(lower)) return { status: 'Evaluated' };
+  if (['aplicado', 'enviada', 'aplicada', 'applied', 'sent'].includes(lower)) return { status: 'Applied' };
+  if (['respondido'].includes(lower)) return { status: 'Responded' };
+  if (['entrevista'].includes(lower)) return { status: 'Interview' };
+  if (['oferta'].includes(lower)) return { status: 'Offer' };
+  if (['contratado', 'contratada', 'hired', 'accepted', 'accept'].includes(lower)) return { status: 'Hired' };
+  if (['cerrada', 'descartada'].includes(lower)) return { status: 'Discarded' };
+  if (['no aplicar', 'no_aplicar', 'skip'].includes(lower)) return { status: 'SKIP' };
 
   // Unknown — flag it
   return { status: null, unknown: true };
@@ -97,7 +92,21 @@ if (!existsSync(APPS_FILE)) {
   console.log('No applications.md found. Nothing to normalize.');
   process.exit(0);
 }
-const content = readFileSync(APPS_FILE, 'utf-8');
+
+let trackerTransaction = null;
+if (!DRY_RUN) {
+  try {
+    trackerTransaction = await openTrackerTransaction(APPS_FILE);
+  } catch (err) {
+    console.error(`Cannot acquire tracker lock: ${err.message}`);
+    process.exit(1);
+  }
+  process.once('exit', () => {
+    try { trackerTransaction.close(); } catch {}
+  });
+}
+try {
+const content = trackerTransaction ? trackerTransaction.read() : readFileSync(APPS_FILE, 'utf-8');
 const lines = content.split('\n');
 
 let changes = 0;
@@ -145,7 +154,7 @@ for (let i = 0; i < lines.length; i++) {
   }
 
   // Reconstruct line
-  const newLine = '| ' + parts.slice(1, -1).join(' | ') + ' |';
+  const newLine = rebuildRow(parts);
   lines[i] = newLine;
   changes++;
 
@@ -163,11 +172,15 @@ console.log(`\n📊 ${changes} statuses normalized`);
 
 if (!DRY_RUN && changes > 0) {
   // Backup first
-  copyFileSync(APPS_FILE, APPS_FILE + '.bak');
-  writeFileSync(APPS_FILE, lines.join('\n'));
-  console.log('✅ Written to applications.md (backup: applications.md.bak)');
+  const backupPath = `${APPS_FILE}.bak`;
+  copyFileSync(APPS_FILE, backupPath);
+  trackerTransaction.replace(lines.join('\n'));
+  console.log(`✅ Written to ${APPS_FILE} (backup: ${backupPath})`);
 } else if (DRY_RUN) {
   console.log('(dry-run — no changes written)');
 } else {
   console.log('✅ No changes needed');
+}
+} finally {
+  trackerTransaction?.close();
 }
